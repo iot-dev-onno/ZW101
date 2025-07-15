@@ -1,255 +1,168 @@
 /*
-  prueba_zw101.ino
+  prueba_zw101_raw_enter_v3.ino
   ESP32 + ZW101/ZW111 Fingerprint Module
+  Menú interactivo leyendo línea completa (ENTER)
+  • Opción 1: Verificar dedo
+  • Opción 2: PS_GetImage con descripción, volcado TX/RX e interpretación
+  • Opción 3: PS_Search (deshabilitado)
 */
 
 #include <Arduino.h>
 
 // Pines del ESP32
-#define SENSOR_RX_PIN   16    // UART2 RX (sensor TX)
-#define SENSOR_TX_PIN   17    // UART2 TX (sensor RX)
-#define TOUCH_OUT_PIN   23    // Señal TOUCH_OUT del sensor
+#define SENSOR_RX_PIN   16  // UART2 RX (sensor TX)
+#define SENSOR_TX_PIN   17  // UART2 TX (sensor RX)
+#define TOUCH_OUT_PIN   23  // Señal TOUCH_OUT del sensor
 
 // Parámetros UART
-#define SENSOR_BAUD     57600 // Velocidad del sensor
+#define SENSOR_BAUD     57600
 
-// Dirección por defecto del dispositivo (4 bytes)
-const uint8_t DEVICE_ADDR[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
+// Dirección por defecto (4 bytes)
+const uint8_t DEVICE_ADDR[4] = { 0xFF,0xFF,0xFF,0xFF };
 
-// ——————————————
-// 1) Definición de tipos y prototipos
-// ——————————————
+// ————— Prototipos —————
+void    flushSerial2();
+void    printHex(const uint8_t* buf, size_t len);
+void    dumpCommand(uint8_t inst, const uint8_t* params = nullptr, uint16_t paramLen = 0);
 
-struct Packet {
-  uint8_t confirmation;
-  uint8_t dataLen;
-  uint8_t data[32];
-};
+void    cmdCheckFinger();
+void    cmdGetImage();
+void    cmdSearchFlash();
 
-void      flushSerial2();
-void      printHex(const uint8_t* buf, size_t len);
-void      dumpCommand(uint8_t instruction, const uint8_t* params = nullptr, uint16_t paramLen = 0);
-void      dumpResponse();
-void      sendCommand(uint8_t instruction, const uint8_t* params = nullptr, uint16_t paramLen = 0);
-bool      readPacket(Packet &pkt);
-bool      handshake();
-bool      checkSensor();
-bool      getImage(Packet &p);
-bool      genChar(uint8_t bufId, Packet &p);
-bool      regModel(Packet &p);
-bool      storeModel(uint16_t addr, Packet &p);
-bool      search(uint16_t start, uint16_t count, uint8_t bufId, Packet &p);
+// ————— Variables globales —————
+String inputBuffer = "";
 
-// ——————————————
-// 2) Setup y loop
-// ——————————————
-
+// ————— Setup y loop —————
 void setup() {
   Serial.begin(115200);
+  while (!Serial) {}
   Serial2.begin(SENSOR_BAUD, SERIAL_8N1, SENSOR_RX_PIN, SENSOR_TX_PIN);
   pinMode(TOUCH_OUT_PIN, INPUT);
   delay(200);
 
-  // Handshake
-  while (!handshake()) {
-    delay(500);
-  }
-  // Verificar sensor
-  if (!checkSensor()) {
-    Serial.println("¡No se pudo validar el sensor!");
-    while (true) delay(1000);
-  }
+  Serial.println(F("\n=== MENÚ HUELLAS ZW101 ==="));
+  Serial.println(F("1: Verificar dedo"));
+  Serial.println(F("2: PS_GetImage"));
+  Serial.println(F("3: PS_Search (deshabilitado)"));
+  Serial.println(F("Elige 1, 2 o 3 + ENTER"));
 }
 
 void loop() {
-  if (digitalRead(TOUCH_OUT_PIN) == HIGH) {
-    Serial.println("¡Dedo detectado! Empezando enrolamiento...");
-    Packet p;
-
-    // 1) Captura imagen
-    if (!getImage(p) || p.confirmation) {
-      Serial.println("Error en GetImage");
-      return;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      inputBuffer.trim();
+      if      (inputBuffer == "1") cmdCheckFinger();
+      else if (inputBuffer == "2") cmdGetImage();
+      else if (inputBuffer == "3") cmdSearchFlash();
+      else if (inputBuffer.length() > 0)
+        Serial.println(F("Opción inválida. Elige 1, 2 o 3."));
+      inputBuffer = "";
+      Serial.println();
+      Serial.println(F("1: Verificar dedo | 2: PS_GetImage | 3: PS_Search (deshab.)"));
+    } else {
+      inputBuffer += c;
     }
-    // 2) GenChar en buffer 1
-    if (!genChar(0x01, p) || p.confirmation) {
-      Serial.println("Error en GenChar(1)");
-      return;
-    }
-    Serial.println("Característica 1 lista, retire el dedo...");
-    delay(2000);
-
-    // 3) Captura segunda imagen
-    while (digitalRead(TOUCH_OUT_PIN) == LOW); // Esperar dedo
-    if (!getImage(p) || p.confirmation) {
-      Serial.println("Error en GetImage (2)");
-      return;
-    }
-    if (!genChar(0x02, p) || p.confirmation) {
-      Serial.println("Error en GenChar(2)");
-      return;
-    }
-    // 4) RegModel
-    if (!regModel(p) || p.confirmation) {
-      Serial.println("Error en RegModel");
-      return;
-    }
-    // 5) Store en addr=1
-    if (!storeModel(0x0001, p) || p.confirmation) {
-      Serial.println("Error en StoreModel");
-      return;
-    }
-
-    Serial.println("Huella enrolada con éxito en addr=1");
-    delay(3000);
   }
 }
 
-// ——————————————
-// 3) Implementación de funciones
-// ——————————————
-
+// ————— Helpers —————
 void flushSerial2() {
   while (Serial2.available()) Serial2.read();
 }
-
 void printHex(const uint8_t* buf, size_t len) {
   for (size_t i = 0; i < len; i++) {
     Serial.printf("%02X ", buf[i]);
   }
   Serial.println();
 }
-
-void dumpCommand(uint8_t instruction, const uint8_t* params, uint16_t paramLen) {
-  uint8_t packetID = 0x01;
-  uint16_t packetLen = 1 + paramLen + 2;
+void dumpCommand(uint8_t inst, const uint8_t* params, uint16_t paramLen) {
+  uint8_t pid = 0x01;
+  uint16_t pktLen = 1 + paramLen + 2;
   uint8_t buf[9 + paramLen];
   int idx = 0;
   buf[idx++] = 0xEF; buf[idx++] = 0x01;
-  memcpy(buf+idx, DEVICE_ADDR, 4); idx += 4;
-  buf[idx++] = packetID;
-  buf[idx++] = highByte(packetLen); buf[idx++] = lowByte(packetLen);
-  buf[idx++] = instruction;
+  memcpy(buf + idx, DEVICE_ADDR, 4); idx += 4;
+  buf[idx++] = pid;
+  buf[idx++] = highByte(pktLen); buf[idx++] = lowByte(pktLen);
+  buf[idx++] = inst;
   for (uint16_t i = 0; i < paramLen; i++) buf[idx++] = params[i];
-  uint16_t sum = packetID + highByte(packetLen) + lowByte(packetLen) + instruction;
+  uint16_t sum = pid + highByte(pktLen) + lowByte(pktLen) + inst;
   for (uint16_t i = 0; i < paramLen; i++) sum += params[i];
-  buf[idx++] = highByte(sum); buf[idx++] = lowByte(sum);
+  buf[idx++] = highByte(sum);
+  buf[idx++] = lowByte(sum);
 
-  Serial.print("TX: ");
+  Serial.print(F("TX: "));
   printHex(buf, idx);
   Serial2.write(buf, idx);
 }
 
-void dumpResponse() {
-  delay(50);
-  size_t n = Serial2.available();
-  if (n == 0) {
-    Serial.println("RX: <vacío>");
+// ————— Comandos menú —————
+
+void cmdCheckFinger() {
+  Serial.println(F("\n--- Comando 1: Verificar dedo ---"));
+  int v = digitalRead(TOUCH_OUT_PIN);
+  if (v == HIGH)
+    Serial.println(F("Mensaje: ¡Dedo detectado!"));
+  else
+    Serial.println(F("Mensaje: No hay dedo."));
+  Serial.printf("RX (crudo pin D23): 0x%02X\n", v);
+}
+
+void cmdGetImage() {
+  Serial.println(F("\n--- Comando 2: PS_GetImage ---"));
+  // 1) Descripción de la función
+  Serial.println(F("Función: When verifying fingerprints, the finger is detected,"));
+  Serial.println(F("  and after detection, the fingerprint image is recorded and"));
+  Serial.println(F("  stored in the image buffer."));
+  Serial.println(F("Input parameters: none"));
+  Serial.println(F("Return: confirmation code"));
+
+  // 2) Verificar dedo antes de enviar comando
+  if (digitalRead(TOUCH_OUT_PIN) != HIGH) {
+    Serial.println(F("Mensaje: No hay dedo. Coloca el dedo sobre el sensor."));
     return;
   }
-  uint8_t buf[128];
+  Serial.println(F("Mensaje: Dedo detectado, iniciando PS_GetImage..."));
+
+  // 3) Enviar y volcar
+  flushSerial2();
+  dumpCommand(0x01);
+
+  // 4) Leer respuesta cruda
+  unsigned long t0 = millis();
+  while (!Serial2.available() && millis() - t0 < 500) {}
+  delay(20);
+  size_t n = Serial2.available();
+  uint8_t buf[64];
   n = Serial2.readBytes(buf, min(n, sizeof(buf)));
-  Serial.print("RX: ");
+  Serial.print(F("RX: "));
   printHex(buf, n);
-}
 
-void sendCommand(uint8_t instruction, const uint8_t* params, uint16_t paramLen) {
-  uint8_t packetID = 0x01;
-  uint16_t packetLen = 1 + paramLen + 2;
-  uint8_t buf[9 + paramLen];
-  int idx = 0;
-  buf[idx++] = 0xEF; buf[idx++] = 0x01;
-  memcpy(buf+idx, DEVICE_ADDR, 4); idx += 4;
-  buf[idx++] = packetID;
-  buf[idx++] = highByte(packetLen); buf[idx++] = lowByte(packetLen);
-  buf[idx++] = instruction;
-  for (uint16_t i = 0; i < paramLen; i++) buf[idx++] = params[i];
-  uint16_t sum = packetID + highByte(packetLen) + lowByte(packetLen) + instruction;
-  for (uint16_t i = 0; i < paramLen; i++) sum += params[i];
-  buf[idx++] = highByte(sum); buf[idx++] = lowByte(sum);
-  Serial2.write(buf, idx);
-}
-
-bool readPacket(Packet &pkt) {
-  const int MIN_BYTES = 12;
-  unsigned long start = millis();
-  while (Serial2.available() < MIN_BYTES) {
-    if (millis() - start > 500) return false;
+  // 5) Interpretación
+  if (n >= 12) {
+    uint8_t conf = buf[9];
+    switch (conf) {
+      case 0x00:
+        Serial.println(F("Interpretación: 0x00 = success, imagen capturada correctamente."));
+        break;
+      case 0x01:
+        Serial.println(F("Interpretación: 0x01 = fail to enroll (impossible to collect image)."));
+        break;
+      case 0x02:
+        Serial.println(F("Interpretación: 0x02 = no finger detected."));
+        break;
+      default:
+        Serial.printf("Interpretación: código 0x%02X no documentado.\n", conf);
+        break;
+    }
+  } else {
+    Serial.println(F("Interpretación: trama demasiado corta para parsear."));
   }
-  while (Serial2.peek() != 0xEF) {
-    Serial2.read();
-    if (millis() - start > 500) return false;
-  }
-  if (Serial2.read() != 0xEF || Serial2.read() != 0x01) return false;
-  for (int i = 0; i < 4; i++) Serial2.read();
-  if (Serial2.read() != 0x07) return false;
-  uint16_t len = (Serial2.read() << 8) | Serial2.read();
-  if (len < 3) return false;
-  pkt.confirmation = Serial2.read();
-  pkt.dataLen = len - 3;
-  for (uint8_t i = 0; i < pkt.dataLen; i++) {
-    pkt.data[i] = Serial2.read();
-  }
-  Serial2.read(); Serial2.read();
-  return true;
 }
 
-bool handshake() {
-  flushSerial2();
-  sendCommand(0x35);
-  Packet p;
-  if (readPacket(p) && p.confirmation == 0x00) {
-    Serial.println("Handshake OK");
-    return true;
-  }
-  Serial.printf("Handshake falló (0x%02X)\n", p.confirmation);
-  return false;
-}
-
-bool checkSensor() {
-  flushSerial2();
-  sendCommand(0x36);
-  Packet p;
-  if (readPacket(p) && p.confirmation == 0x00) {
-    Serial.println("Sensor detectado");
-    return true;
-  }
-  Serial.printf("CheckSensor falló (0x%02X)\n", p.confirmation);
-  return false;
-}
-
-bool getImage(Packet &p) {
-  flushSerial2();
-  sendCommand(0x01);
-  return readPacket(p);
-}
-
-bool genChar(uint8_t bufId, Packet &p) {
-  flushSerial2();
-  sendCommand(0x02, &bufId, 1);
-  return readPacket(p);
-}
-
-bool regModel(Packet &p) {
-  flushSerial2();
-  sendCommand(0x05);
-  return readPacket(p);
-}
-
-bool storeModel(uint16_t addr, Packet &p) {
-  uint8_t params[3] = { 0x01, highByte(addr), lowByte(addr) };
-  flushSerial2();
-  sendCommand(0x06, params, 3);
-  return readPacket(p);
-}
-
-bool search(uint16_t start, uint16_t count, uint8_t bufId, Packet &p) {
-  uint8_t params[5] = {
-    highByte(start), lowByte(start),
-    highByte(count), lowByte(count),
-    bufId
-  };
-  flushSerial2();
-  sendCommand(0x04, params, 5);
-  return readPacket(p);
+void cmdSearchFlash() {
+  Serial.println(F("\n--- Comando 3: PS_Search (deshabilitado) ---"));
+  Serial.println(F("Esta función está deshabilitada por el momento."));
 }

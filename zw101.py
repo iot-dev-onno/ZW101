@@ -307,7 +307,7 @@ def main():
             # 4) Eliminar huella
             elif opt == '4':
                 pid = int(input("ID a eliminar: "))
-                code, msg = ps_delete_char(ser, pid)0
+                code, msg = ps_delete_char(ser, pid)
                 print(f" DeleteChar(ID={pid}) → {msg}\n")
             # 5) Salir
             elif opt == '5':
